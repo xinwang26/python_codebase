@@ -1,0 +1,440 @@
+# -*- coding: utf-8 -*-
+"""
+This module defines a class implementing a simple autoencoder (currentplan is only 1 hidden layer). 
+All the computation is designed to be run using only python 
+
+Todo:
+	*matrix multiply general solution for mat * mat, mat * vec, vec * mat, need to also consider small / large or large /small
+	*forward propagation
+	*cost calculate
+	*back propagation
+	*derivative of loss function for autoencoder
+Records of decisions:
+	All parameters need to be processed as simple python data types, data will be processed with pyspark RDD or dataframe consider data size.
+	Will try to incorporate local implement with pandas dataframe or numpy arrays after
+"""
+from __future__ import division,print_function 
+from sklearn.metrics import roc_auc_score,roc_curve, auc
+import random
+import pyspark 
+from pyspark.sql import HiveContext
+import pyspark.sql.functions as F
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+import datetime
+
+sc = pyspark.SparkContext.getOrCreate()
+hive_context = HiveContext(sc)
+hive_context.sql("use risk") #pass sql sentence, will not really run untill any action taken
+sc.setLogLevel("ERROR")
+
+print("reflecting the updates " + str(datetime.datetime.now()))
+
+sc.addFile("/home/wangx17/src/activations.py")
+from activations import *
+
+def transformfunc1(arr):
+	return np.abs(arr)**(1/3)/(100)  
+def transformfunc2(arr):
+	return np.abs(arr) /1000
+
+def minibatch(dataset,batch_size =50000,random_seed_batch = 0,tempfile_prefix = "MLP_",folder="./data/"):
+	'''
+	@dataset: sparkDF
+	@batch_size: integer
+	@random_seed_batch: integer
+	@tempfile_prefix: string
+	@rtype: None
+	'''
+	sample_size = dataset.count()
+	portion = float(batch_size) / sample_size
+	num_batches = int(1.0 / portion) if portion < 1.0 else 1.0
+	if num_batches <= 1.0:
+		dataset.toPandas().to_csv(tempfile_prefix + "only" + ".csv",index =False)
+		filenames = tempfile_prefix + "only" + ".csv"
+		return
+	print("Each minibatch contains around " + str(batch_size) + " observations",end= "\r")
+	partition_list = dataset.randomSplit([1.0 / num_batches] * num_batches, random_seed_batch)
+	obsnum_check = []
+	for par in range(num_batches):
+		print("partitioning the " + str(par + 1) + "th batch",end= "\r")
+		obsnum_check.append(partition_list[par].count())
+		partition_list[par].toPandas().to_csv(folder + tempfile_prefix+str(par) + '.csv',index =False)
+		try:
+			filenames.append(folder + tempfile_prefix+str(par) + '.csv')  
+		except:
+			filenames = [folder + tempfile_prefix+str(par) + '.csv']
+	assert(np.sum(obsnum_check) == sample_size)
+	return filenames
+
+def normalize(dataset,varnames,valtrans,voltrans):
+	'''
+	@dataset: pandas
+	@rtype: numpy array
+	'''
+	# from sklearn.preprocessing import StandardScaler,MinMaxScaler
+	if len(varnames) > len(dataset.columns):
+		for colu in list(set(varnames) - set(dataset.columns)):
+			dataset[colu] = 0
+	input_layer = dataset.loc[:,varnames].values
+	for i in range(len(varnames)):
+		varname = varnames[i]		
+		if "value" in varname:
+			input_layer[:,i] = valtrans(input_layer[:,i])
+		if "volume" in varname:
+			input_layer[:,i] = voltrans(input_layer[:,i])
+	return input_layer
+
+def forward_prop(input_layer,W1,W2,B1,B2,activationfunc = ReLU):#forward
+	'''
+	@input_layer: n * p array
+	@W1: p * h array
+	@W2: h * p array
+	@B1: h * 1 array
+	@B2: p * 1 array
+	@activationfunc: numeric 1-1 mapping function applicable to array
+	@rtype: (Z1,Z2,output)
+	'''
+	Z1 = np.dot(input_layer,W1) + B1
+	hidden_layer = activationfunc(Z1)
+	Z2 = np.dot(hidden_layer,W2) + B2
+	output_layer = activationfunc(Z2)
+	return Z1,hidden_layer,Z2,output_layer
+
+def backward_prop(input_layer,W1,W2,B1,B2,activationfunc = ReLU,activationderivative = ReLU_derivative, learning_rate = 0.005, calculatloss= False):#backward
+	'''
+	@input_layer: n * p array
+	@W1: p * h array
+	@W2: h * p array
+	@B1: h * 1 array
+	@B2: p * 1 array
+	@activationfunc: numeric 1-1 mapping function applicable to array
+	'''
+	batch_size = input_layer.shape[0]
+	Z1,hidden_layer,Z2,output_layer = forward_prop(input_layer,W1,W2,B1,B2,activationfunc)
+	dJdOut =  output_layer - input_layer 
+	dOutdZ2 = activationderivative(Z2) #m*p da2dz2, out is a2
+	#dZ2dw2 = hidden_layer
+	dhiddendZ1 = activationderivative(Z1)
+	dJdb2 = np.multiply(dJdOut,dOutdZ2)
+	dJdw2 = hidden_layer.T.dot(dJdb2)
+	#djdA1
+	dJdb1 = dJdb2.dot(W2.T)
+	dJdw1 = input_layer.T.dot(np.multiply(dJdb1,dhiddendZ1))
+	dJdb2 = dJdb2.sum(axis =0)/batch_size
+	dJdb1 = dJdb1.sum(axis =0)/batch_size
+	dJdw2 /= batch_size
+	dJdw1 /= batch_size
+	W1 -= dJdw1 * learning_rate
+	W2 -= dJdw2 * learning_rate
+	B1 -= dJdb1 * learning_rate
+	B2 -= dJdb2 * learning_rate
+	return W1,W2,B1,B2,output_layer
+
+def sse(input_layer,output_layer):
+	'''calculate current total loss no matter how many batches were updated'''	 
+	return 0.5*np.square((input_layer - output_layer)).sum(axis=1)
+
+def loadModel(path="./", file_name="MLP_model.txt"):
+	import json
+	loaded_dict = json.load(open(path + file_name))
+	return loaded_dict
+
+def saveModel(model= '',path="./data/",file_name = "MLP_model.txt"):
+	import json
+	with open(path+file_name, 'w') as file:
+		file.write(json.dumps(model))
+
+def model_init(varnames,hidden_size):
+	input_size = output_size = len(varnames)
+	W1 = np.random.rand(input_size,hidden_size) /np.sqrt(input_size)
+	W2  = np.random.rand(hidden_size,output_size) /np.sqrt(hidden_size)
+	B1 = np.zeros(hidden_size)	
+	B2 = np.zeros(output_size)	
+	return W1,W2,B1,B2
+
+def test(testfilenames,varnames,W1,W2,B1,B2,activationfunc_TEST,valtrans,voltrans):
+	'''
+	@testdf: 
+	@rtype: 
+	'''
+	loss,n = 0,0
+	for file in testfilenames:
+		try:
+			input_layer = normalize(pd.read_csv(file),varnames,valtrans,voltrans)
+			_,_,_,output_layer = forward_prop(input_layer,W1,W2,B1,B2,activationfunc = activationfunc_TEST)
+			loss += sse(input_layer,output_layer).sum()
+			n += input_layer.shape[0]
+		except IOError as e:
+			print("cannot load "+ file)
+			break
+
+	return loss/float(n)
+
+def train(num_epoch,valtrans,voltrans,init_paras = [],trainfilenames = [],testfilenames = [], varnames = [], activation_func = ReLU ,activation_derivative = ReLU_derivative,testing = False,learning_rate = 0.01,batch_size = 50000, printfreq =1, modelsavename = "MLP_coefs.txt"):
+	'''
+	@num_epoch: integer
+	@trainfilenames: [string] string is file name and path
+	@trainfilenames: [string] string is file name and path
+	@learning_rate: float
+	'''
+	tracking_train = []
+	tracking_test = []
+	if len(trainfilenames) <1:
+		trainfilenames = minibatch(traindf,batch_size,tempfile_prefix = "MLP_train_")
+	if testing and len(testfilenames) <1:
+		testfilenames = minibatch(testdf,batch_size,tempfile_prefix = "MLP_test_")
+	try:
+		W1,W2,B1,B2 = init_paras
+	except:
+		Error("Initial Parameter Error!")
+	starttime = time.time()
+	for iter_i in xrange(num_epoch):
+		loss, test_loss = 0,0
+		n, ntest = 0,0
+		for file in trainfilenames:
+			try:
+				input_layer = normalize(pd.read_csv(file),varnames,valtrans,voltrans)
+				W1,W2,B1,B2,output_layer = backward_prop(input_layer,W1,W2,B1,B2,activationfunc = activation_func,activationderivative = activation_derivative, learning_rate = 0.01)
+				loss += sse(input_layer,output_layer).sum()
+				n += input_layer.shape[0]
+			except IOError as e:
+				print("cannot load "+ file)
+				break
+		tracking_train.append(loss/float(n)) #switch to mse now
+		if testing:
+			test_loss = test(testfilenames,varnames,W1,W2,B1,B2,activation_func,valtrans,voltrans)
+			tracking_test.append(test_loss)
+		if iter_i == 0:
+			print("-----%s------" % (time.time()-starttime))
+		if iter_i % printfreq == 0:		
+			print("at epoch "+str(iter_i)+", raw loss is "+str(loss/float(n))+", the testing data raw loss is "+str(test_loss))
+	model_coef = {"W1": W1.tolist(), "W2": W2.tolist(), "B1": B1.tolist(), "B2":B2.tolist(), "acrication_func":activation_func.__name__}
+	if not testing:
+		test_loss = test(testfilenames,varnames,W1,W2,B1,B2,activation_func,valtrans,voltrans)
+		print("the testing data raw loss is "+str(test_loss))
+	saveModel(model_coef, file_name=modelsavename)
+	print("Finished training in -----%s------" % (time.time()-starttime))
+	return model_coef
+
+
+def evaluation(model_coef,valtrans,voltrans,alertdatapath = "/home/wangx17/alert_evaluate20181217.csv",activationfunc_EVAL =ReLU,testfilenames = [] \
+			   ,case_columns=[],testdf = "",indexvar=["account_sk","account_key"], extravarincluded = ['is_alert',"is_SB"], varnames = []\
+			   ,refit_coef = False,inherit_coefs = {},saveerror= False):
+	'''
+	@rtype: reconstruction error pandas dataframe
+	'''
+	W1,W2,B1,B2 = np.array(model_coef['W1']),np.array(model_coef['W2']),np.array(model_coef['B1']),np.array(model_coef['B2'])
+	result = pd.DataFrame()
+	difffilelist,n = [],0
+	for i in range(len(indexvar)):
+		assert(indexvar[i] in pd.read_csv(testfilenames[0]).columns)
+	from sklearn.metrics import roc_auc_score,roc_curve, auc
+	from sklearn.linear_model import LinearRegression
+	# from pyspark.sql import HiveContext
+	from pyspark.sql.functions import col
+	for file in testfilenames:
+		try:
+			print ("scoring " + file,end= "\r")
+			input_pd = pd.read_csv(file)
+			input_layer = normalize(input_pd,varnames,valtrans,voltrans)
+			_,_,_,output_layer = forward_prop(input_layer,W1,W2,B1,B2,activationfunc = activationfunc_EVAL)
+			diff_pd = input_pd.copy()
+			diff_pd.loc[:,varnames] = ReLU(np.multiply(input_layer -output_layer,1*(input_layer > 0)))
+		except IOError as e:
+			print("cannot load "+ file)
+			break
+# 		print(diff_pd.shape)		
+		if saveerror:
+			diff_pd.to_csv(file.replace('.csv',"")+"_diff.csv",index = False)
+			difffilelist.append(file.replace('.csv',"")+"_diff.csv")
+		try:
+			result = pd.concat((result, diff_pd),axis =0)
+		except:
+			result = diff_pd
+		n += input_layer.shape[0]
+	# print(n,result.shape[0])
+	assert(n == result.shape[0])
+	testtxnmonthsk = input_pd.month[0]
+	alert_eval = pd.read_csv(alertdatapath).loc[lambda df: df.alert_month_sk -1 == testtxnmonthsk] #alert month sk should be already month_sk +1
+	alert_eval['is_alert'] = 1
+	result = result.merge(alert_eval,on=indexvar,how = "left")
+	scores = ['raw_score','max_diff']
+	result['raw_score'] = np.square(result.loc[:,varnames]).sum(axis=1)
+	result['max_diff'] = result.loc[:,varnames].max(axis = 1)
+	lrcoef = inherit_coefs
+	for case_col in case_columns:
+		if refit_coef:
+			lr = LinearRegression().fit(np.square(result.loc[:,varnames]),result[case_col].fillna(0))
+			lrcoef[case_col] = lr.coef_
+		result[case_col+"_score"+"_"+str(int(testtxnmonthsk))] = np.multiply(np.square(result.loc[:,varnames]),lrcoef[case_col]).sum(axis=1)
+		scores.append(case_col+"_score"+"_"+str(int(testtxnmonthsk)))
+	# hive_context = HiveContext(sc)
+	# result_spk = hive_context.createDataFrame(result[indexvar+scores+case_columns+extravarincluded])
+	return difffilelist,result,lrcoef
+
+def eval_seg_pd(resultpd,typesegvars = ['account_product_sk','account_type_sk'],segmenttable = "/home/wangx17/segment_mapping_check.csv",\
+	seg_variables=['PRE_SEG_ACCT1','PRE_SEG_ACCT2','PRODUCT_GROUPING1_0'],scorevar="raw_score",sampletotalobss=[1000,2000]):
+	'''
+	@rtype: pandas
+	'''
+	import pyspark.sql.functions as F
+	from pyspark.sql import Window
+	from pyspark.sql.functions import desc
+	print("There are "+ str(resultpd.shape[0]) + " accounts.")
+	results = {}
+	if seg_variables[0] not in resultpd.columns:
+		print("result table does not have segments, will merge from given table")
+		seg_mapping_pd = pd.read_csv(segmenttable)
+		resultpd = resultpd.merge(seg_mapping_pd[typesegvars + seg_variables],on = typesegvars,how = 'left')
+	month_alert, month_case, month_sar = resultpd[['is_alert','is_case',"is_sar"]].sum()
+	SB_alert, SB_case, SB_sar = resultpd.loc[lambda df: df['is_SB'] ==1][['is_alert','is_case',"is_sar"]].sum()
+	for segvar in seg_variables:
+		resultpd['count_by_'+ segvar] = resultpd.groupby(segvar)[scorevar].transform('count')
+		for sampletotal in sampletotalobss:
+			resultpd[scorevar + "_by_" + segvar] = resultpd.groupby(segvar)[scorevar].rank(ascending = False)
+			resultpd['sample_by_'+ segvar+"_"+str(sampletotal)] = (resultpd['count_by_'+ segvar] * float(sampletotal)/resultpd.shape[0]).apply(lambda x: np.max([x,1.0]))
+			to_alert = resultpd.loc[resultpd[scorevar + "_by_" + segvar]<= resultpd['sample_by_'+ segvar+"_"+str(sampletotal)]]
+			# to_alert.toPandas().to_csv(segvar+str(sampletotal)+".csv")
+			seg_case,seg_alert = to_alert['is_case'].sum(),to_alert.shape[0]
+			seg_sar, seg_SB_sar =  to_alert['is_sar'].sum(),to_alert.loc[lambda df: df['is_SB'] ==1]['is_sar'].sum()
+			SB_seg_case,SB_seg_alert = to_alert.loc[lambda df: df['is_SB'] ==1][['is_case','is_alert']].sum()
+			overlap_alert = to_alert['is_alert'].sum()
+			results[segvar+"_"+str(sampletotal)] = {"cap_case":seg_case,"exist_cs":month_case,"cap_SB_cs":SB_seg_case,"existSB_cs":SB_case,\
+													"cap_alert":overlap_alert,"exist_alt":month_alert,"cap_SB_alt":SB_seg_alert,"existSB_alt":SB_alert,\
+													"cap_sar":seg_sar,"exist_sar":month_sar,"cap_SB_sar":seg_SB_sar,"existSB_sar":SB_sar,\
+													"num_new_alt":seg_alert
+													}
+	resultspanda =pd.DataFrame.from_dict(results, orient='index')
+	return resultspanda,resultpd
+
+def pull_alerted_input(testfilenames, alert_pd_table, ID_var = "account_sk"):
+	alerted_input = pd.DataFrame()
+	for file in testfilenames:
+		try:
+			print ("extracting " + file,end= "\r")
+			input_pd = pd.read_csv(file).merge(alert_pd_table[[ID_var]],on=[ID_var],how = "inner")
+			alerted_input = pd.concat([alerted_input,input_pd],axis = 0)
+		except IOError as e:
+			print("cannot load "+ file)
+			break
+	assert alerted_input.shape[0] == alert_pd_table.shape[0],"alerted account number not the same to pulled"
+	return alerted_input
+
+def weighting(scoredatarow,lrcoef,varnames,txn_code_raw_dict,mappingtablepath = "/home/wangx17/mapping_table_txn_type_varnmaes.csv",case_col = "is_case",\
+	ids= ['account_sk','account_key',"party_key"],k=10,vartokeep=['is_case_score_227','raw_score','is_case_score_227_by_PRE_SEG_ACCT1','count_by_PRE_SEG_ACCT1','PRE_SEG_ACCT1']):
+	
+	assert(lrcoef[case_col].shape[0] == scoredatarow[varnames].shape[0])
+	
+	weighted_score = np.multiply(np.square(scoredatarow[varnames]),lrcoef[case_col])
+	totalscore = weighted_score[weighted_score>0].sum()
+#	 scoredatarow[varnames] = weighted_score
+	mappingtable = pd.read_csv(mappingtablepath) #the csv will be updated when data aggregation get updated
+	
+	transaction_sk = mappingtable.set_index('varname_Xin')[['transaction_code_sk']].to_dict()['transaction_code_sk']
+	transaction_sk['tp_OTHER_monthvolume'] = 99999.0
+	transaction_sk['tp_OTHER_monthvalue'] = 99999.0
+
+	transaction_code =  mappingtable.set_index('varname_Xin')[['transaction_code_cd']].to_dict()['transaction_code_cd']
+	transaction_code['tp_OTHER_monthvalue']  = "Other"
+	transaction_code['tp_OTHER_monthvolume']  = "Other"
+
+	transaction_desc = mappingtable.set_index('varname_Xin')[['description']].to_dict()['description']
+	transaction_desc['tp_OTHER_monthvalue']  = "Other"
+	transaction_desc['tp_OTHER_monthvolume']  = "Other"
+
+	indices = np.argsort(weighted_score)[::-1]
+	
+	top_k = [varnames[nn] for nn in indices]
+	top_k_scores = [weighted_score[x] for x in indices]
+	top_k_rawscores = [np.square(scoredatarow[varnames])[x] for x in indices]
+	top_k_txn_types = [transaction_desc[i] for i in top_k]
+	top_k_txn_codes = [transaction_code[i] for i in top_k]
+	top_k_txn_sks = [transaction_sk[i] for i in top_k]
+	topscores = []
+	j,ct = 0,0
+	while j < len(varnames):
+		if scoredatarow["__original__"+top_k[j]] > 0 and top_k_scores[j] >0:
+			ct += 1
+			if ct <=10:
+				scoredatarow["Top_" + str(ct) + "_Score"]  = top_k_scores[j]/ totalscore
+				if(scoredatarow["Top_" + str(ct) + "_Score"] ) < 0.01:
+					ct -=1
+					j += 1
+					continue
+				scoredatarow["Top_" + str(ct) +"_Description"] = txn_code_raw_dict[top_k_txn_sks[j]]
+				scoredatarow["Top_" + str(ct) + "_Transaction_Code"] = top_k_txn_codes[j]
+				scoredatarow["Top_" + str(ct) + "_Transaction_sk"] = str(top_k_txn_sks[j])
+				scoredatarow["Top_" + str(ct) + "_Feature Category"] = "Volume" if "volume" in top_k[j] else "Value" 
+				scoredatarow["Top_" + str(ct) + "_Monthly_total"] = scoredatarow["__original__"+top_k[j]]
+				topscores.extend(("Top_" + str(ct) +"_Description",\
+								  "Top_" + str(ct) + "_Transaction_Code",\
+								  "Top_" + str(ct) + "_Transaction_sk",\
+								  "Top_" + str(ct) + "_Feature Category",\
+								  "Top_" + str(ct) + "_Score",\
+								  "Top_" + str(ct) + "_Monthly_total"))
+		j += 1
+	return scoredatarow[ids +vartokeep + topscores ]
+
+# def weightadj(resultdata,alertdata,indexvar = "account_sk",targetvarnames = ["is_case",'is_alert'],recalculateweight = False):
+# 	if indexvar in alertdata:
+# 		alertdata = alertdata.set_index(indexvar)
+# 	result = pd.DataFrame(0.5*np.square((test_input - test_output)),\
+#								columns =varnames,index =test_inputpd.index )
+# 	result = result.join(alertdata[targetvarnames],how = 'left').fillna(0)
+# 	if recalculateweight:
+# 		from sklearn.linear_model import LinearRegression
+# 		clf = LinearRegression().fit(result[varnames], result[targetvarnames[0]])
+# 		mseweights = clf.coef_
+# 	result['RC_err'] = result[varnames].sum(axis = 1)
+# 	result['weighted_RCerr'] = result[varnames].values.dot(mseweights)
+# 	fpr, tpr, thresholds = roc_curve(result[targetvarnames[0]], result['weighted_RCerr'])
+# 	print("weighted AUC",auc(fpr, tpr))
+# 	if recalculateweight:
+# 		import datetime as dt
+# 		suffix = dt.datetime.now()
+# 		suffix.day
+# 		np.save("mseweights"+str(suffix.day)+"_"+str(suffix.hour)+str(suffix.minute) ,mseweights)
+
+
+
+
+
+
+if __name__ == "__main__":
+	# minibatch(dataset = inputdf, random_seed_batch = random_seed,tempfile_prefix = "MLP_train_")
+	folder = "/home/wangx17/data/"
+
+	file1  = pd.read_csv("./data/MLP_train_0.csv",nrows=6)
+	varnames = [colu for colu in file1.columns if "value" in colu or "volume" in colu ]
+	input_size,hidden_size,num_hidden_layers = len(varnames),20,1
+	output_size = input_size
+	inits = model_init(varnames,hidden_size)
+	print("hidden layer number is %5d, hidden layer width is %5d, output size is %5d") %(num_hidden_layers,hidden_size,output_size)
+
+	trainfiles = [folder + "MLP_train_"+str(i)+".csv" for i in range(25)]
+	testfiles = [folder + "MLP_test_"+str(i)+".csv" for i in range(23)]
+
+	model_coef = train(20,init_paras = inits,trainfilenames = trainfiles,testfilenames = testfiles, varnames = varnames, activation_func = ReLU ,\
+	  activation_derivative = ReLU_derivative,testing = True,learning_rate = 0.03,batch_size = 50000, printfreq =1)
+	powervalue = 0.33
+	def transformfunc1(arr):
+		return np.abs(arr)**(powervalue)/(100)  
+	def transformfunc2(arr):
+		return np.abs(arr)/1000
+	resultfilelist, resultpd = evaluation(model_coef,transformfunc1,transformfunc2,alertdatapath = "/home/wangx17/alert_evaluate20181217.csv",activationfunc_EVAL =ReLU,testfilenames = testfiles,case_columns=['is_case','is_case_raw'],testdf = "",segment_proportion=None,segment_variable="")
+	### functions testing:
+	# cachepara = np.array(model_coef['W1']),np.array(model_coef['W2']),np.array(model_coef['B1']),np.array(model_coef['B2'])
+	# W1,W2,B1,B2 = np.array(model_coef['W1']),np.array(model_coef['W2']),np.array(model_coef['B1']),np.array(model_coef['B2'])
+	# activationfunc_EVAL =ReLU
+	# input_layer = normalize(input_pd.loc[:,varnames])
+	# _,_,_,output_layer = forward_prop(input_layer,W1,W2,B1,B2,activationfunc = activationfunc_EVAL)
+	# diff_pd = pd.DataFrame(input_layer - output_layer,columns=varnames)
+	# pd.DataFrame(np.concatenate((output_layer[0,:].reshape(144,1),\
+	#							  input_layer[0,:].reshape(144,1),\
+	#							  input_pd1.loc[0,:].values.reshape(144,1),\
+	#							  (-output_layer[0,:]+input_layer[0,:]).reshape(144,1),\
+	#							  rcerror_pd.loc[0,:].values.reshape(144,1), B2.reshape(144,1)),axis=1),columns = ['out','in','in_orig','diff','err','b2'])\
+	# .sort_values('err',ascending=False).head()
